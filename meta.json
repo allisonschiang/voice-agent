@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "allisonorg:voice-agent",
   "visibility": "private",
-  "url": "",
+  "url": "https://github.com/allisonschiang/voice-agent",
   "description": "Three composable generic services for a voice (or text) command pipeline. audio-to-text: mic + Google STT + wake-word trim, emits transcripts to a configured downstream. text-router: domain-agnostic string → DoCommand dispatcher with config-driven phrase table, optional spoken acknowledgment, optional LLM fallback — works for voice transcripts, chat, CLI, MQTT, anything. ai-responder: Anthropic Claude + TTS for freeform speech generation, also usable standalone to speak arbitrary text.",
   "models": [
     {
