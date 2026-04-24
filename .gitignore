@@ -1,0 +1,8 @@
+bin/
+/test
+/voice-agent
+module.tar.gz
+*.log
+.DS_Store
+.vscode/
+.idea/
