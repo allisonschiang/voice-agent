@@ -182,6 +182,7 @@ func (a *audioToText) Reconfigure(ctx context.Context, deps resource.Dependencie
 //	{"command":"record"}  single-shot record
 //	{"command":"text"}    return the last transcript
 func (a *audioToText) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	a.logger.Infof("ALLISONDEBUGGING audio-to-text DoCommand received: %+v", cmd)
 	command, ok := cmd["command"].(string)
 	if !ok {
 		return nil, fmt.Errorf("missing or invalid \"command\" field")
@@ -238,37 +239,48 @@ func (a *audioToText) listenLoop(ctx context.Context) {
 
 	audioChan, err := audioIn.GetAudio(ctx, "pcm16", 0, 0, nil)
 	if err != nil {
-		a.logger.Errorf("audio-to-text: failed to start audio stream: %v", err)
+		a.logger.Errorf("ALLISONDEBUGGING audio-to-text: failed to start audio stream: %v", err)
 		return
 	}
 
-	a.logger.Infof("audio-to-text: listen mode started — waiting for speech")
+	a.logger.Infof("ALLISONDEBUGGING audio-to-text: listen loop running — waiting for speech")
 
 	for {
 		transcript, ok := a.streamingCollectAndTranscribe(ctx, audioChan)
 		if !ok {
+			a.logger.Infof("ALLISONDEBUGGING audio-to-text: listen loop exiting (context cancelled or stream closed)")
 			return
 		}
+		a.logger.Infof("ALLISONDEBUGGING audio-to-text: raw transcript from STT (before wake-word trim): %q", transcript)
 		if transcript == "" {
+			a.logger.Infof("ALLISONDEBUGGING audio-to-text: empty transcript, skipping")
 			continue
 		}
 
-		transcript = a.trimWakeWord(transcript)
-		if transcript == "" {
+		trimmed := a.trimWakeWord(transcript)
+		a.logger.Infof("ALLISONDEBUGGING audio-to-text: transcript after wake-word trim: %q (wake_word=%q)", trimmed, a.wakeWord)
+		if trimmed == "" {
+			a.logger.Infof("ALLISONDEBUGGING audio-to-text: transcript empty after trim, skipping")
 			continue
 		}
+		transcript = trimmed
 
 		a.mu.Lock()
 		a.lastTranscript = transcript
 		downstream := a.downstream
 		a.mu.Unlock()
 
-		a.logger.Infof("audio-to-text: transcript: %s", transcript)
-
 		if downstream != nil {
-			if _, err := downstream.DoCommand(ctx, map[string]interface{}{"transcript": transcript}); err != nil {
-				a.logger.Errorf("audio-to-text: downstream DoCommand failed: %v", err)
+			payload := map[string]interface{}{"transcript": transcript}
+			a.logger.Infof("ALLISONDEBUGGING audio-to-text: dispatching to downstream with payload: %+v", payload)
+			resp, err := downstream.DoCommand(ctx, payload)
+			if err != nil {
+				a.logger.Errorf("ALLISONDEBUGGING audio-to-text: downstream DoCommand FAILED: %v", err)
+			} else {
+				a.logger.Infof("ALLISONDEBUGGING audio-to-text: downstream response: %+v", resp)
 			}
+		} else {
+			a.logger.Infof("ALLISONDEBUGGING audio-to-text: no downstream configured — transcript logged only")
 		}
 		if ctx.Err() != nil {
 			return
@@ -318,9 +330,10 @@ func (a *audioToText) streamingCollectAndTranscribe(ctx context.Context, audioCh
 	streamCtx, streamCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer streamCancel()
 
+	a.logger.Infof("ALLISONDEBUGGING audio-to-text: opening new Google STT streaming connection (timeout=60s)")
 	stream, err := client.StreamingRecognize(streamCtx)
 	if err != nil {
-		a.logger.Errorf("audio-to-text: StreamingRecognize open failed: %v", err)
+		a.logger.Errorf("ALLISONDEBUGGING audio-to-text: StreamingRecognize open failed: %v", err)
 		return "", true
 	}
 
@@ -365,27 +378,37 @@ func (a *audioToText) streamingCollectAndTranscribe(ctx context.Context, audioCh
 	}()
 
 	var buf []byte
+	chunkCount := 0
+	firstChunkLogged := false
 	for {
 		select {
 		case <-ctx.Done():
+			a.logger.Infof("ALLISONDEBUGGING audio-to-text: context cancelled mid-stream after %d chunks, %d bytes", chunkCount, len(buf))
 			stream.CloseSend()
 			return "", false
 		case chunk, ok := <-audioChan:
 			if !ok {
+				a.logger.Infof("ALLISONDEBUGGING audio-to-text: audioChan closed after %d chunks, %d bytes", chunkCount, len(buf))
 				stream.CloseSend()
 				return "", false
 			}
 			if len(chunk.AudioData) == 0 {
+				a.logger.Infof("ALLISONDEBUGGING audio-to-text: utterance boundary (empty chunk) received after %d chunks, %d bytes — closing stream", chunkCount, len(buf))
 				stream.CloseSend()
 				goto waitResult
 			}
+			if !firstChunkLogged {
+				a.logger.Infof("ALLISONDEBUGGING audio-to-text: first audio chunk received (%d bytes) — speech detected upstream", len(chunk.AudioData))
+				firstChunkLogged = true
+			}
+			chunkCount++
 			buf = append(buf, chunk.AudioData...)
 			if err := stream.Send(&speechpb.StreamingRecognizeRequest{
 				StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
 					AudioContent: chunk.AudioData,
 				},
 			}); err != nil {
-				a.logger.Warnf("audio-to-text: send audio chunk failed: %v", err)
+				a.logger.Warnf("ALLISONDEBUGGING audio-to-text: send audio chunk failed after %d chunks, %d bytes: %v", chunkCount, len(buf), err)
 				stream.CloseSend()
 				goto waitResult
 			}
@@ -393,7 +416,7 @@ func (a *audioToText) streamingCollectAndTranscribe(ctx context.Context, audioCh
 	}
 
 waitResult:
-	a.logger.Infof("audio-to-text: streaming STT sent %d bytes, waiting for final", len(buf))
+	a.logger.Infof("ALLISONDEBUGGING audio-to-text: streaming STT sent %d bytes across %d chunks, waiting for final transcript", len(buf), chunkCount)
 
 	a.mu.Lock()
 	a.lastRecording = buf
@@ -402,14 +425,16 @@ waitResult:
 	select {
 	case res := <-resultCh:
 		if res.err != nil {
-			a.logger.Errorf("audio-to-text: streaming STT error: %v", res.err)
+			a.logger.Errorf("ALLISONDEBUGGING audio-to-text: streaming STT error: %v", res.err)
 			return "", true
 		}
+		a.logger.Infof("ALLISONDEBUGGING audio-to-text: STT returned final transcript: %q", res.transcript)
 		return res.transcript, true
 	case <-time.After(10 * time.Second):
-		a.logger.Errorf("audio-to-text: streaming STT timed out")
+		a.logger.Errorf("ALLISONDEBUGGING audio-to-text: streaming STT timed out waiting for final result (10s after CloseSend)")
 		return "", true
 	case <-ctx.Done():
+		a.logger.Infof("ALLISONDEBUGGING audio-to-text: context cancelled while waiting for STT final")
 		return "", false
 	}
 }

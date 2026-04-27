@@ -176,6 +176,7 @@ func (r *responder) Reconfigure(ctx context.Context, deps resource.Dependencies,
 //	{"result": true}       → return the last result string
 //	{"speak": "<text>"}    → speak text directly via TTS (bypass Claude)
 func (r *responder) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	r.logger.Infof("ALLISONDEBUGGING ai-responder DoCommand received: %+v", cmd)
 	if text, ok := cmd["process"].(string); ok && text != "" {
 		return r.doProcess(ctx, text)
 	}
@@ -183,7 +184,9 @@ func (r *responder) DoCommand(ctx context.Context, cmd map[string]interface{}) (
 		return r.doProcess(ctx, text)
 	}
 	if text, ok := cmd["speak"].(string); ok && text != "" {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: direct speak request (bypassing Claude), text=%q", text)
 		if err := r.speak(ctx, text); err != nil {
+			r.logger.Errorf("ALLISONDEBUGGING ai-responder: speak FAILED: %v", err)
 			return nil, err
 		}
 		return map[string]interface{}{"status": "ok", "spoken": text}, nil
@@ -201,12 +204,14 @@ func (r *responder) DoCommand(ctx context.Context, cmd map[string]interface{}) (
 }
 
 func (r *responder) doProcess(ctx context.Context, text string) (map[string]interface{}, error) {
+	r.logger.Infof("ALLISONDEBUGGING ai-responder: doProcess input text=%q", text)
 	r.mu.Lock()
 	r.lastInput = text
 	r.mu.Unlock()
 
 	result, err := r.callClaude(ctx, text)
 	if err != nil {
+		r.logger.Errorf("ALLISONDEBUGGING ai-responder: callClaude FAILED: %v", err)
 		return nil, err
 	}
 
@@ -217,11 +222,14 @@ func (r *responder) doProcess(ctx context.Context, text string) (map[string]inte
 
 	spoken := false
 	if tts != nil && result != "" {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: passing Claude result to speak()")
 		if err := r.speak(ctx, result); err != nil {
-			r.logger.Warnf("ai-responder: TTS failed: %v", err)
+			r.logger.Warnf("ALLISONDEBUGGING ai-responder: TTS failed: %v", err)
 		} else {
 			spoken = true
 		}
+	} else {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: skipping TTS (tts_configured=%t, result_empty=%t)", tts != nil, result == "")
 	}
 
 	return map[string]interface{}{
@@ -251,23 +259,28 @@ func (r *responder) callClaude(pipelineCtx context.Context, transcript string) (
 
 	contextStr := ""
 	if ctxSvc != nil && ctxCmd != nil {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: fetching context with command=%+v field=%q", ctxCmd, ctxField)
 		result, err := ctxSvc.DoCommand(ctx, ctxCmd)
 		if err != nil {
-			r.logger.Warnf("ai-responder: context fetch failed: %v", err)
+			r.logger.Warnf("ALLISONDEBUGGING ai-responder: context fetch FAILED: %v", err)
 		} else {
+			r.logger.Infof("ALLISONDEBUGGING ai-responder: context service raw response: %+v", result)
 			var toMarshal interface{} = result
 			if ctxField != "" {
 				if val, ok := result[ctxField]; ok {
 					toMarshal = val
+					r.logger.Infof("ALLISONDEBUGGING ai-responder: extracted context_field %q value=%+v", ctxField, val)
 				} else {
-					r.logger.Warnf("ai-responder: context_field %q not in response", ctxField)
+					r.logger.Warnf("ALLISONDEBUGGING ai-responder: context_field %q not in response", ctxField)
 				}
 			}
 			if b, err := json.Marshal(toMarshal); err == nil {
 				contextStr = string(b)
-				r.logger.Infof("ai-responder: context: %s", contextStr)
+				r.logger.Infof("ALLISONDEBUGGING ai-responder: final context string: %s", contextStr)
 			}
 		}
+	} else {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: no context_service or context_command configured — skipping context fetch")
 	}
 
 	finalPrompt := prompt
@@ -280,6 +293,7 @@ func (r *responder) callClaude(pipelineCtx context.Context, transcript string) (
 	}
 
 	userContent := finalPrompt + "\n\n" + transcript
+	r.logger.Infof("ALLISONDEBUGGING ai-responder: sending to Claude model=%q max_tokens=%d userContent=%q", model, maxTokens, userContent)
 
 	msg, err := client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(model),
@@ -292,6 +306,7 @@ func (r *responder) callClaude(pipelineCtx context.Context, transcript string) (
 		},
 	})
 	if err != nil {
+		r.logger.Errorf("ALLISONDEBUGGING ai-responder: Claude API call FAILED: %v", err)
 		return "", fmt.Errorf("Claude API call failed: %w", err)
 	}
 
@@ -302,7 +317,7 @@ func (r *responder) callClaude(pipelineCtx context.Context, transcript string) (
 		}
 	}
 	result := strings.Join(parts, "\n")
-	r.logger.Infof("ai-responder: Claude: %s", result)
+	r.logger.Infof("ALLISONDEBUGGING ai-responder: Claude returned (stop_reason=%s): %q", msg.StopReason, result)
 	return result, nil
 }
 
@@ -313,26 +328,35 @@ func (r *responder) speak(ctx context.Context, text string) error {
 	r.mu.Unlock()
 
 	if tts == nil {
+		r.logger.Warnf("ALLISONDEBUGGING ai-responder: speak called but no TTS configured — returning error")
 		return fmt.Errorf("no TTS configured")
 	}
 
 	// Pause wake detection so TTS output doesn't retrigger the mic.
 	if audioIn != nil {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: pausing wake-word detection on audio_input before TTS")
 		if _, err := audioIn.DoCommand(ctx, map[string]interface{}{"pause_detection": nil}); err != nil {
-			r.logger.Warnf("ai-responder: pause_detection failed: %v", err)
+			r.logger.Warnf("ALLISONDEBUGGING ai-responder: pause_detection FAILED: %v", err)
 		}
+	} else {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: no audio_input configured — not pausing detection (may cause self-retrigger)")
 	}
 
-	if _, err := tts.DoCommand(ctx, map[string]interface{}{"say": text}); err != nil {
+	ttsPayload := map[string]interface{}{"say": text}
+	r.logger.Infof("ALLISONDEBUGGING ai-responder: CALLING TTS with payload=%+v (text length=%d)", ttsPayload, len(text))
+	if _, err := tts.DoCommand(ctx, ttsPayload); err != nil {
+		r.logger.Errorf("ALLISONDEBUGGING ai-responder: TTS DoCommand FAILED: %v", err)
 		if audioIn != nil {
 			_, _ = audioIn.DoCommand(ctx, map[string]interface{}{"resume_detection": nil})
 		}
 		return fmt.Errorf("TTS failed: %w", err)
 	}
+	r.logger.Infof("ALLISONDEBUGGING ai-responder: TTS DoCommand returned successfully")
 
 	if audioIn != nil {
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: resuming wake-word detection on audio_input after TTS")
 		if _, err := audioIn.DoCommand(ctx, map[string]interface{}{"resume_detection": nil}); err != nil {
-			r.logger.Warnf("ai-responder: resume_detection failed: %v", err)
+			r.logger.Warnf("ALLISONDEBUGGING ai-responder: resume_detection FAILED: %v", err)
 		}
 	}
 

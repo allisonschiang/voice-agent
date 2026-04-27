@@ -191,6 +191,7 @@ func newRouter(ctx context.Context, deps resource.Dependencies, conf resource.Co
 //	{"list-phrases": true}                             → return the phrase table
 //	{"test": "<text>"}                                 → dry-run match (no dispatch)
 func (r *router) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	r.logger.Infof("ALLISONDEBUGGING router DoCommand received: %+v", cmd)
 	if list, ok := cmd["list-phrases"].(bool); ok && list {
 		return r.doList(), nil
 	}
@@ -208,7 +209,9 @@ func (r *router) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 
 func (r *router) doInput(ctx context.Context, text string) (map[string]interface{}, error) {
 	norm := normalize(text)
+	r.logger.Infof("ALLISONDEBUGGING router: input=%q normalized=%q", text, norm)
 	if norm == "" {
+		r.logger.Infof("ALLISONDEBUGGING router: empty normalized input — returning handled=false")
 		return map[string]interface{}{"handled": false, "reason": "empty transcript"}, nil
 	}
 
@@ -219,38 +222,51 @@ func (r *router) doInput(ctx context.Context, text string) (map[string]interface
 	ackTarget := r.ackTarget
 	r.mu.RUnlock()
 
+	r.logger.Infof("ALLISONDEBUGGING router: checking %d routes for exact match on %q", len(routes), norm)
+
 	// Exact match against the whole normalized transcript.
 	for _, route := range routes {
 		if norm == route.say {
-			r.logger.Infof("router: matched %q → target=%s", route.say, route.target)
+			r.logger.Infof("ALLISONDEBUGGING router: MATCHED route say=%q target=%q do=%+v ack=%q ack_failure=%q", route.say, route.target, route.do, route.ack, route.ackFailure)
 			target, ok := targets[route.target]
 			if !ok {
+				r.logger.Errorf("ALLISONDEBUGGING router: target %q not resolved (should not happen post-Reconfigure)", route.target)
 				return nil, fmt.Errorf("router: target %q not resolved", route.target)
 			}
+			r.logger.Infof("ALLISONDEBUGGING router: dispatching to target=%q with payload=%+v", route.target, route.do)
 			actionResp, dispatchErr := target.DoCommand(ctx, route.do)
 			if dispatchErr != nil {
+				r.logger.Warnf("ALLISONDEBUGGING router: target %q DoCommand FAILED: %v", route.target, dispatchErr)
 				// Speak the failure message if configured, then return the
 				// original error to the caller.
-				spokenErr := ""
 				if route.ackFailure != "" && ackTarget != nil {
-					if _, ackErr := ackTarget.DoCommand(ctx, map[string]interface{}{"speak": route.ackFailure}); ackErr != nil {
-						r.logger.Warnf("router: ack_failure speak failed: %v", ackErr)
+					ackPayload := map[string]interface{}{"speak": route.ackFailure}
+					r.logger.Infof("ALLISONDEBUGGING router: dispatching ack_failure to ack_target with payload=%+v", ackPayload)
+					if _, ackErr := ackTarget.DoCommand(ctx, ackPayload); ackErr != nil {
+						r.logger.Warnf("ALLISONDEBUGGING router: ack_failure speak FAILED: %v", ackErr)
 					} else {
-						spokenErr = route.ackFailure
+						r.logger.Infof("ALLISONDEBUGGING router: ack_failure dispatched successfully: %q", route.ackFailure)
 					}
+				} else {
+					r.logger.Infof("ALLISONDEBUGGING router: no ack_failure configured for this route or no ack_target set")
 				}
-				r.logger.Warnf("router: target %q DoCommand failed: %v (spoke: %q)", route.target, dispatchErr, spokenErr)
 				return nil, fmt.Errorf("router: target %q DoCommand failed: %w", route.target, dispatchErr)
 			}
+			r.logger.Infof("ALLISONDEBUGGING router: target=%q returned: %+v", route.target, actionResp)
 			// Speak the acknowledgment, if configured. Errors here don't fail
 			// the command — the action has already run.
 			spoken := ""
 			if route.ack != "" && ackTarget != nil {
-				if _, ackErr := ackTarget.DoCommand(ctx, map[string]interface{}{"speak": route.ack}); ackErr != nil {
-					r.logger.Warnf("router: ack speak failed: %v", ackErr)
+				ackPayload := map[string]interface{}{"speak": route.ack}
+				r.logger.Infof("ALLISONDEBUGGING router: dispatching ack to ack_target with payload=%+v", ackPayload)
+				if _, ackErr := ackTarget.DoCommand(ctx, ackPayload); ackErr != nil {
+					r.logger.Warnf("ALLISONDEBUGGING router: ack speak FAILED: %v", ackErr)
 				} else {
 					spoken = route.ack
+					r.logger.Infof("ALLISONDEBUGGING router: ack dispatched successfully")
 				}
+			} else {
+				r.logger.Infof("ALLISONDEBUGGING router: no ack configured for this route or no ack_target set")
 			}
 			return map[string]interface{}{
 				"handled":  true,
@@ -265,11 +281,14 @@ func (r *router) doInput(ctx context.Context, text string) (map[string]interface
 
 	// No match — fall through to LLM if configured.
 	if fallback != nil {
-		r.logger.Infof("router: no phrase match, forwarding to fallback: %q", text)
-		actionResp, err := fallback.DoCommand(ctx, map[string]interface{}{"process": text})
+		fallbackPayload := map[string]interface{}{"process": text}
+		r.logger.Infof("ALLISONDEBUGGING router: no route match, forwarding to fallback with payload=%+v", fallbackPayload)
+		actionResp, err := fallback.DoCommand(ctx, fallbackPayload)
 		if err != nil {
+			r.logger.Errorf("ALLISONDEBUGGING router: fallback DoCommand FAILED: %v", err)
 			return nil, fmt.Errorf("router: fallback DoCommand failed: %w", err)
 		}
+		r.logger.Infof("ALLISONDEBUGGING router: fallback returned: %+v", actionResp)
 		return map[string]interface{}{
 			"handled":  true,
 			"matched":  "",
@@ -278,7 +297,7 @@ func (r *router) doInput(ctx context.Context, text string) (map[string]interface
 		}, nil
 	}
 
-	r.logger.Infof("router: no match for %q (no fallback configured)", text)
+	r.logger.Infof("ALLISONDEBUGGING router: NO MATCH for %q and no fallback configured — dropping", text)
 	return map[string]interface{}{"handled": false, "reason": "no phrase matched and no fallback configured"}, nil
 }
 
