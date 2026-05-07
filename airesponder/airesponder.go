@@ -43,6 +43,21 @@ type Config struct {
 	// (audio_output) — ai-responder just hands it text via {"say": ...}.
 	TTS        string `json:"tts,omitempty"`         // generic service, receives {"say": "<text>"}
 	AudioInput string `json:"audio_input,omitempty"` // if set, pause/resume wake-word detection around TTS playback
+
+	// FollowUpWindowSeconds: if > 0, after TTS playback finishes, open a
+	// bypass window on AudioInput so the user can reply for this many seconds
+	// without saying the wake word. Requires AudioInput to support
+	// {"open_window": <seconds>} (e.g. allisonorg:filtered-audio-fix:wake-word-filter).
+	// Each speak() resets the window, so back-and-forth conversation extends it.
+	FollowUpWindowSeconds float64 `json:"follow_up_window_seconds,omitempty"`
+
+	// EngineMoveTemplate / HumanMoveTemplate: user-content sent to Claude when
+	// a {"event":"move_made"} arrives. Supports {move} and {fen} placeholders,
+	// substituted at call time. Edit these in config to change Gary's
+	// commentary style without a module reload — Reconfigure picks them up on
+	// every save. If unset, sensible defaults are used.
+	EngineMoveTemplate string `json:"engine_move_template,omitempty"`
+	HumanMoveTemplate  string `json:"human_move_template,omitempty"`
 }
 
 // Validate returns dependencies.
@@ -81,8 +96,12 @@ type responder struct {
 	contextCommand map[string]interface{}
 	contextField   string
 
-	tts     resource.Resource
-	audioIn resource.Resource
+	tts                   resource.Resource
+	audioIn               resource.Resource
+	followUpWindowSeconds float64
+
+	engineMoveTemplate string
+	humanMoveTemplate  string
 
 	lastInput  string
 	lastResult string
@@ -166,17 +185,33 @@ func (r *responder) Reconfigure(ctx context.Context, deps resource.Dependencies,
 		r.audioIn = nil
 	}
 
+	r.followUpWindowSeconds = cfg.FollowUpWindowSeconds
+
+	r.engineMoveTemplate = cfg.EngineMoveTemplate
+	if r.engineMoveTemplate == "" {
+		r.engineMoveTemplate = "I (Gary) just played {move}. Comment briefly in first person, one short sentence."
+	}
+	r.humanMoveTemplate = cfg.HumanMoveTemplate
+	if r.humanMoveTemplate == "" {
+		r.humanMoveTemplate = "My opponent just played {move}. React briefly, one short sentence."
+	}
+
 	return nil
 }
 
 // DoCommand surface:
 //
-//	{"process": "<text>"}  → run the full pipeline (Claude → optional TTS) and return {result, spoken}
-//	{"ask": "<text>"}      → alias of "process"
-//	{"result": true}       → return the last result string
-//	{"speak": "<text>"}    → speak text directly via TTS (bypass Claude)
+//	{"process": "<text>"}                          → run the full pipeline (Claude → optional TTS) and return {result, spoken}
+//	{"ask": "<text>"}                              → alias of "process"
+//	{"result": true}                               → return the last result string
+//	{"speak": "<text>"}                            → speak text directly via TTS (bypass Claude)
+//	{"event": "move_made", "move": "...", "by": ...}
+//	                                               → translate a domain event into a "process" call
 func (r *responder) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	r.logger.Infof("ALLISONDEBUGGING ai-responder DoCommand received: %+v", cmd)
+	if event, ok := cmd["event"].(string); ok && event != "" {
+		return r.doEvent(ctx, event, cmd)
+	}
 	if text, ok := cmd["process"].(string); ok && text != "" {
 		return r.doProcess(ctx, text)
 	}
@@ -200,7 +235,44 @@ func (r *responder) DoCommand(ctx context.Context, cmd map[string]interface{}) (
 		}
 		return map[string]interface{}{"status": "ok", "result": result}, nil
 	}
-	return nil, fmt.Errorf("ai-responder: expected one of {process, ask, speak, result} in command")
+	return nil, fmt.Errorf("ai-responder: expected one of {process, ask, speak, result, event} in command")
+}
+
+// doEvent translates a domain event payload into a process-style call. Lets
+// upstream producers (e.g. the chess module) emit semantic events without
+// knowing how to phrase them — this layer constructs the user-facing prompt.
+//
+// Templates for move_made come from config (engine_move_template,
+// human_move_template) so the wording can be tuned in app.viam.com without
+// a module reload — Reconfigure picks up changes on every save.
+func (r *responder) doEvent(ctx context.Context, event string, cmd map[string]interface{}) (map[string]interface{}, error) {
+	switch event {
+	case "move_made":
+		move, _ := cmd["move"].(string)
+		fen, _ := cmd["fen"].(string)
+		by, _ := cmd["by"].(string)
+
+		r.mu.Lock()
+		var template string
+		switch by {
+		case "engine":
+			template = r.engineMoveTemplate
+		case "human":
+			template = r.humanMoveTemplate
+		default:
+			template = "A move was played: {move}. Comment briefly."
+		}
+		r.mu.Unlock()
+
+		text := strings.ReplaceAll(template, "{move}", move)
+		text = strings.ReplaceAll(text, "{fen}", fen)
+		text = strings.ReplaceAll(text, "{by}", by)
+
+		r.logger.Infof("ALLISONDEBUGGING ai-responder: event=%q by=%q move=%q -> process %q", event, by, move, text)
+		return r.doProcess(ctx, text)
+	default:
+		return nil, fmt.Errorf("ai-responder: unknown event %q", event)
+	}
 }
 
 func (r *responder) doProcess(ctx context.Context, text string) (map[string]interface{}, error) {
@@ -325,6 +397,7 @@ func (r *responder) speak(ctx context.Context, text string) error {
 	r.mu.Lock()
 	tts := r.tts
 	audioIn := r.audioIn
+	followUpSeconds := r.followUpWindowSeconds
 	r.mu.Unlock()
 
 	if tts == nil {
@@ -357,6 +430,12 @@ func (r *responder) speak(ctx context.Context, text string) error {
 		r.logger.Infof("ALLISONDEBUGGING ai-responder: resuming wake-word detection on audio_input after TTS")
 		if _, err := audioIn.DoCommand(ctx, map[string]interface{}{"resume_detection": nil}); err != nil {
 			r.logger.Warnf("ALLISONDEBUGGING ai-responder: resume_detection FAILED: %v", err)
+		}
+		if followUpSeconds > 0 {
+			r.logger.Infof("ALLISONDEBUGGING ai-responder: opening follow-up bypass window for %.1fs", followUpSeconds)
+			if _, err := audioIn.DoCommand(ctx, map[string]interface{}{"open_window": followUpSeconds}); err != nil {
+				r.logger.Warnf("ALLISONDEBUGGING ai-responder: open_window FAILED: %v", err)
+			}
 		}
 	}
 

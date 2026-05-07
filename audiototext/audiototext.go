@@ -340,6 +340,7 @@ func (a *audioToText) streamingCollectAndTranscribe(ctx context.Context, audioCh
 	if err := stream.Send(&speechpb.StreamingRecognizeRequest{
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 			StreamingConfig: &speechpb.StreamingRecognitionConfig{
+				SingleUtterance: true,
 				Config: &speechpb.RecognitionConfig{
 					Encoding:        speechpb.RecognitionConfig_LINEAR16,
 					SampleRateHertz: 16000,

@@ -7,15 +7,21 @@
   "models": [
     {
       "api": "rdk:service:generic",
-      "model": "allisonorg:voice-agent:audio-to-text"
+      "model": "allisonorg:voice-agent:audio-to-text",
+      "short_description": "Mic + Google STT + wake-word trim, dispatches transcripts downstream",
+      "markdown_link": "README.md#model-allisonorgvoice-agentaudio-to-text"
     },
     {
       "api": "rdk:service:generic",
-      "model": "allisonorg:voice-agent:text-router"
+      "model": "allisonorg:voice-agent:text-router",
+      "short_description": "Phrase-table dispatcher with optional LLM fallback and spoken acks",
+      "markdown_link": "README.md#model-allisonorgvoice-agenttext-router"
     },
     {
       "api": "rdk:service:generic",
-      "model": "allisonorg:voice-agent:ai-responder"
+      "model": "allisonorg:voice-agent:ai-responder",
+      "short_description": "Claude + TTS for freeform speech; also handles move_made events",
+      "markdown_link": "README.md#model-allisonorgvoice-agentai-responder"
     }
   ],
   "build": {
